@@ -185,7 +185,10 @@ views will be NULL.
 
 See
 [PostgreSQL documentation](http://www.postgresql.org/docs/devel/static/monitoring-stats.html#WAIT-EVENT-TABLE)
-for list of possible wait events.
+for list of possible wait events. Among these pre-defined events current
+extension adds the special state "without wait" that might be considered as
+"CPU time". This name is defined as event type for this state and event value
+takes NULL value.
 
 Contribution
 ------------
