@@ -119,7 +119,21 @@ probe_waits(const bool write_history, const bool write_profile)
 	if (write_history)
 		LWLockAcquire(pgws_history_lock, LW_EXCLUSIVE);
 
-	/* Iterate PGPROCs under shared lock */
+	/*
+	 * Iterate PGPROCs under shared lock
+	 *
+	 * TODO: ProcArrayLock is heavy enough therefore it's worth to segregate the
+	 * logic of wait events extraction under ProcArrayLock and loading them into
+	 * history and profile structures under corresponding locks.
+	 *
+	 * FIXME: In fact ProcArrayLock doesn't protect PGPROC slots from concurrent
+	 * modification, it just guards `procArray` that is used for indirect access
+	 * to these slots.
+	 * In general, iteration over regular backends might be organized via
+	 * iterator over internal `procArray` variable under ProcArrayLock and over
+	 * auxiliary processes via iterator over internal `AuxiliaryProcs` variable
+	 * without any locks as it's done in pg_stat_get_activity() function.
+	 */
 	LWLockAcquire(ProcArrayLock, LW_SHARED);
 	for (int i = 0; i < ProcGlobal->allProcCount; i++)
 	{
@@ -128,21 +142,12 @@ probe_waits(const bool write_history, const bool write_profile)
 		int32 	 	wait_event_info = proc->wait_event_info,
 					pid = proc->pid;
 
-		// FIXME: zero pid actually doesn't indicate that process slot is freed.
-		// After process termination this field becomes unchanged and thereby
-		// stores the pid of previous process. The possible indicator of process
-		// termination might be a condition `proc->procLatch->owner_pid == 0`.
-		// Abother option is to use the lists of freed PGPROCs from ProcGlocal:
-		// freeProcs, walsenderFreeProcs, bgworkerFreeProcs and autovacFreeProcs
-		// to define indexes of all freed slots in allProcs.
-		// The most appropriate solution here is to iterate over ProcArray items
-		// to explicitly access to the all live PGPROC entries. This will
-		// require to build iterator object over protected procArray.
-		if (pid == 0)
-			continue;
-
-		// TODO: take into account the state without waiting as CPU time
-		if (wait_event_info == 0)
+		/*
+		 * Each backend process disowns its latch after completion, condition
+		 * with pid value is just supplementary.
+		 * We also doesn't instrument itself.
+		 */
+		if ((proc->procLatch.owner_pid == 0 || pid == 0) || proc == MyProc)
 			continue;
 
 		/* Write to the history if needed */
@@ -193,6 +198,7 @@ probe_waits(const bool write_history, const bool write_profile)
 			}
 		}
 	}
+
 	LWLockRelease(ProcArrayLock);
 
 	if (write_history)

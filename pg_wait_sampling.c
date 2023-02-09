@@ -362,6 +362,22 @@ search_proc(int pid)
 	return NULL;
 }
 
+inline static const char *
+pgwsEventTypeName(uint32 wait_event_info)
+{
+	if (wait_event_info)
+		return pgstat_get_wait_event_type(wait_event_info);
+	return "CPU time";
+}
+
+inline static const char *
+pgwsEventName(uint32 wait_event_info)
+{
+	if (wait_event_info)
+		return pgstat_get_wait_event(wait_event_info);
+	return NULL;
+}
+
 typedef struct
 {
 	HistoryItem	   *items;
@@ -462,8 +478,8 @@ pg_wait_sampling_get_current(PG_FUNCTION_ARGS)
 		MemSet(values, 0, sizeof(values));
 		MemSet(nulls, 0, sizeof(nulls));
 
-		event_type = pgstat_get_wait_event_type(item->wait_event_info);
-		event = pgstat_get_wait_event(item->wait_event_info);
+		event_type = pgwsEventTypeName(item->wait_event_info);
+		event = pgwsEventName(item->wait_event_info);
 		values[0] = Int32GetDatum(item->pid);
 		if (event_type)
 			values[1] = PointerGetDatum(cstring_to_text(event_type));
@@ -563,8 +579,8 @@ pg_wait_sampling_get_profile(PG_FUNCTION_ARGS)
 		MemSet(nulls, 0, sizeof(nulls));
 
 		/* Make and return next tuple to caller */
-		event_type = pgstat_get_wait_event_type(item->key.wait_event_info);
-		event = pgstat_get_wait_event(item->key.wait_event_info);
+		event_type = pgwsEventTypeName(item->key.wait_event_info);
+		event = pgwsEventName(item->key.wait_event_info);
 		if (WhetherProfilePid)
 			values[0] = Int32GetDatum(item->key.pid);
 		else
@@ -697,8 +713,8 @@ pg_wait_sampling_get_history(PG_FUNCTION_ARGS)
 		MemSet(values, 0, sizeof(values));
 		MemSet(nulls, 0, sizeof(nulls));
 
-		event_type = pgstat_get_wait_event_type(item->wait_event_info);
-		event = pgstat_get_wait_event(item->wait_event_info);
+		event_type = pgwsEventTypeName(item->wait_event_info);
+		event = pgwsEventName(item->wait_event_info);
 		values[0] = Int32GetDatum(item->pid);
 		values[1] = TimestampTzGetDatum(item->ts);
 		if (event_type)
