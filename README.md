@@ -145,7 +145,9 @@ in-memory ring buffer.
 | queryid     | int8        | Id of query             |
 
 `pg_wait_sampling_profile` view – profile of wait events obtained by sampling into
-in-memory hash table.
+in-memory hash table. The row with all NULL values in key fields denotes the
+total number of samples in profile and serves as reference point to estimate
+the percent of load for other counters.
 
 | Column name | Column type |      Description        |
 | ----------- | ----------- | ----------------------- |

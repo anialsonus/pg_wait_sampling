@@ -21,6 +21,7 @@
 #endif
 #include "storage/ipc.h"
 #include "storage/proc.h"
+#include "storage/shm_toc.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #if PG_VERSION_NUM >= 140000
@@ -65,8 +66,9 @@ static void pgws_ExecutorEnd(QueryDesc *queryDesc);
 
 /* Pointers to shared memory objects */
 pgwsQueryId *pgws_proc_queryids = NULL;
-HTAB		*pgws_hash = NULL;
-LWLock		*pgws_hash_lock = NULL;
+HTAB		*pgws_profile_hash = NULL;
+uint64		*pgws_profile_samples = NULL;
+LWLock		*pgws_profile_lock = NULL;
 History		*pgws_history_ring = NULL;
 LWLock		*pgws_history_lock = NULL;
 
@@ -130,21 +132,34 @@ get_max_procs_count(void)
 	return count;
 }
 
+static Size
+pgws_shm_toc_size()
+{
+	shm_toc_estimator	e;
+	Size                size = 0;
+	const int           nkeys = 3;
+
+	shm_toc_initialize_estimator(&e);
+
+	shm_toc_estimate_chunk(&e, sizeof(pgwsQueryId) * get_max_procs_count());
+	shm_toc_estimate_chunk(&e, sizeof(uint64));
+	shm_toc_estimate_chunk(&e,
+			sizeof(History) + sizeof(HistoryItem) * HistoryBufferSize);
+
+	shm_toc_estimate_keys(&e, nkeys);
+	size = shm_toc_estimate(&e);
+
+	return size;
+}
+
 /*
  * Estimate amount of shared memory needed.
  */
-static Size
+static inline Size
 pgws_shmem_size(void)
 {
-	Size size = 0;
-
-	size = add_size(size, sizeof(pgwsQueryId) * get_max_procs_count());
-	size = add_size(size, hash_estimate_size(MaxProfileEntries,
-											 sizeof(ProfileHashKey)));
-	size = add_size(size,
-					sizeof(History) + sizeof(HistoryItem) * HistoryBufferSize);
-
-	return size;
+	return pgws_shm_toc_size()
+		 + hash_estimate_size(MaxProfileEntries, sizeof(ProfileHashEntry));
 }
 
 static void
@@ -221,6 +236,10 @@ pgws_shmem_startup(void)
 {
 	bool	found;
 	HASHCTL	info;
+	Size	shm_toc_size = pgws_shm_toc_size();
+	int		i = 0;
+	void   	*pgws_shmem;
+	shm_toc	*toc;
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
@@ -228,32 +247,46 @@ pgws_shmem_startup(void)
 	/* Create or attach to the shared memory state */
 	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
 
-	pgws_proc_queryids = ShmemInitStruct(
-			"pg_wait_sampling queryids",
-			sizeof(pgwsQueryId) * get_max_procs_count(),
-			&found);
-	MemSet(pgws_proc_queryids, 0, sizeof(pgwsQueryId) * get_max_procs_count());
+	pgws_shmem = ShmemInitStruct("pg_wait_sampling", shm_toc_size, &found);
 	if (!found)
 	{
-		/* First time through ... */
+		/* first time through ... */
 		LWLockPadded *locks = GetNamedLWLockTranche("pg_wait_sampling");
 
-		pgws_hash_lock = &(locks[0]).lock;
+		toc = shm_toc_create(PG_WAIT_SAMPLING_MAGIC, pgws_shmem, shm_toc_size);
+
+		pgws_proc_queryids = shm_toc_allocate(toc,
+				sizeof(pgwsQueryId) * get_max_procs_count());
+		shm_toc_insert(toc, i++, pgws_proc_queryids);
+		MemSet(pgws_proc_queryids, 0, sizeof(uint64) * get_max_procs_count());
+
+		pgws_profile_samples = shm_toc_allocate(toc, sizeof(uint64));
+		shm_toc_insert(toc, i++, pgws_profile_samples);
+		*pgws_profile_samples = 0;
+
+		pgws_history_ring = shm_toc_allocate(toc,
+				sizeof(History) + sizeof(HistoryItem) * HistoryBufferSize);
+		shm_toc_insert(toc, i++, pgws_history_ring);
+		pgws_history_ring->index = 0;
+
+		pgws_profile_lock = &(locks[0]).lock;
 		pgws_history_lock = &(locks[1]).lock;
 	}
+	else
+	{
+		toc = shm_toc_attach(PG_WAIT_SAMPLING_MAGIC, pgws_shmem);
 
-	pgws_history_ring = ShmemInitStruct(
-			"pg_wait_sampling history ring",
-			sizeof(History) + sizeof(HistoryItem) * HistoryBufferSize,
-			&found);
-	pgws_history_ring->index = 0;
+		pgws_proc_queryids = shm_toc_lookup(toc, i++, false);
+		pgws_profile_samples = shm_toc_lookup(toc, i++, false);
+		pgws_history_ring = shm_toc_lookup(toc, i++, false);
+	}
 
 	memset(&info, 0, sizeof(info));
 	info.keysize = sizeof(ProfileHashKey);
 	info.entrysize = sizeof(ProfileHashEntry);
-	pgws_hash = ShmemInitHash("pg_wait_sampling hash",
-							  MaxProfileEntries, MaxProfileEntries,
-							  &info, HASH_ELEM | HASH_BLOBS);
+	pgws_profile_hash = ShmemInitHash("pg_wait_sampling profile hash",
+									  MaxProfileEntries, MaxProfileEntries,
+									  &info, HASH_ELEM | HASH_BLOBS);
 
 	LWLockRelease(AddinShmemInitLock);
 
@@ -501,13 +534,27 @@ pg_wait_sampling_get_current(PG_FUNCTION_ARGS)
 	}
 }
 
+typedef struct
+{
+	int32		pid;
+	uint32		wait_event_info;
+	pgwsQueryId	queryid;
+	uint64		counter;
+} ProfileItem;
+
+typedef struct
+{
+	uint64		total_samples;
+	int			n_items;
+	ProfileItem items[FLEXIBLE_ARRAY_MEMBER];
+} Profile;
 
 PG_FUNCTION_INFO_V1(pg_wait_sampling_get_profile);
 Datum
 pg_wait_sampling_get_profile(PG_FUNCTION_ARGS)
 {
-	ProfileHashEntry	*profile;
-	FuncCallContext		*funcctx;
+	Profile			*profile;
+	FuncCallContext	*funcctx;
 
 	check_shmem();
 
@@ -524,22 +571,29 @@ pg_wait_sampling_get_profile(PG_FUNCTION_ARGS)
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
 		/* Extract profile from shared memory */
-		profile_count = hash_get_num_entries(pgws_hash);
-		profile = (ProfileHashEntry *)
-			palloc(sizeof(ProfileHashEntry) * profile_count);
+		profile_count = hash_get_num_entries(pgws_profile_hash);
+		profile = (Profile *)
+			palloc(sizeof(Profile) + sizeof(ProfileItem) * profile_count);
+		profile->n_items = profile_count;
 
 		entry_index = 0;
-		LWLockAcquire(pgws_hash_lock, LW_SHARED);
-		hash_seq_init(&hash_seq, pgws_hash);
+		LWLockAcquire(pgws_profile_lock, LW_SHARED);
+		hash_seq_init(&hash_seq, pgws_profile_hash);
 		while ((entry = hash_seq_search(&hash_seq)) != NULL)
 		{
-			profile[entry_index++] = *entry;
+			profile->items[entry_index++] = (ProfileItem) {
+				entry->key.pid,
+				entry->key.wait_event_info,
+				entry->key.queryid,
+				entry->counter
+			};
 		}
-		LWLockRelease(pgws_hash_lock);
+		profile->total_samples = *pgws_profile_samples;
+		LWLockRelease(pgws_profile_lock);
 
 		/* Build result rows */
 		funcctx->user_fctx = profile;
-		funcctx->max_calls = profile_count;
+		funcctx->max_calls = profile_count + 1;
 
 		/* Make tuple descriptor */
 		tupdesc = CreateTemplateTupleDescCompat(5, false);
@@ -561,28 +615,28 @@ pg_wait_sampling_get_profile(PG_FUNCTION_ARGS)
 	/* stuff done on every call of the function */
 	funcctx = SRF_PERCALL_SETUP();
 
-	profile = (ProfileHashEntry *) funcctx->user_fctx;
+	profile = (Profile *) funcctx->user_fctx;
 
-	if (funcctx->call_cntr < funcctx->max_calls)
+	if (funcctx->call_cntr < profile->n_items)
 	{
 		/* for each row */
 		Datum		values[5];
 		bool		nulls[5];
 		HeapTuple	tuple;
-		ProfileHashEntry *item;
-		const char *event_type,
-				   *event;
+		ProfileItem *item;
+		const char 	*event_type,
+					*event;
 
-		item = &profile[funcctx->call_cntr];
+		item = &profile->items[funcctx->call_cntr];
 
 		MemSet(values, 0, sizeof(values));
 		MemSet(nulls, 0, sizeof(nulls));
 
 		/* Make and return next tuple to caller */
-		event_type = pgwsEventTypeName(item->key.wait_event_info);
-		event = pgwsEventName(item->key.wait_event_info);
+		event_type = pgwsEventTypeName(item->wait_event_info);
+		event = pgwsEventName(item->wait_event_info);
 		if (WhetherProfilePid)
-			values[0] = Int32GetDatum(item->key.pid);
+			values[0] = Int32GetDatum(item->pid);
 		else
 			nulls[0] = true;
 		if (event_type)
@@ -595,11 +649,27 @@ pg_wait_sampling_get_profile(PG_FUNCTION_ARGS)
 			nulls[2] = true;
 
 		if (WhetherProfileQueryId)
-			values[3] = UInt64GetDatum(item->key.queryid);
+			values[3] = UInt64GetDatum(item->queryid);
 		else
 			nulls[3] = true;
 
 		values[4] = UInt64GetDatum(item->counter);
+
+		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+
+		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+	}
+	else if (funcctx->call_cntr < funcctx->max_calls)
+	{
+		/* print total sample counter with key fields as NULL */
+		Datum		values[5];
+		bool		nulls[5];
+		HeapTuple	tuple;
+
+		MemSet(values, 0, sizeof(values));
+		MemSet(nulls, true, sizeof(nulls) - 1);
+		values[4] = UInt64GetDatum(profile->total_samples);
+		nulls[4] = false;
 
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 
@@ -621,16 +691,16 @@ pg_wait_sampling_reset_profile(PG_FUNCTION_ARGS)
 
 	check_shmem();
 
-	LWLockAcquire(pgws_hash_lock, LW_EXCLUSIVE);
+	LWLockAcquire(pgws_profile_lock, LW_EXCLUSIVE);
 
 	/* Remove all profile entries. */
-	hash_seq_init(&hash_seq, pgws_hash);
+	hash_seq_init(&hash_seq, pgws_profile_hash);
 	while ((entry = hash_seq_search(&hash_seq)) != NULL)
 	{
-		hash_search(pgws_hash, &entry->key, HASH_REMOVE, NULL);
+		hash_search(pgws_profile_hash, &entry->key, HASH_REMOVE, NULL);
 	}
 
-	LWLockRelease(pgws_hash_lock);
+	LWLockRelease(pgws_profile_lock);
 
 	/*
 	 * TODO: consider saving of the time of statistics reset to more easly

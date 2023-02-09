@@ -51,14 +51,15 @@ typedef struct
 typedef struct
 {
 	ProfileHashKey	key;		/* hash key of entry - MUST BE FIRST */
-	int64			counter;	/* cummulative counter for this entry */
+	uint64			counter;	/* cummulative counter for this entry */
 	double			usage;		/* usage factor */
 } ProfileHashEntry;
 
 /* pg_wait_sampling.c */
 extern pgwsQueryId	*pgws_proc_queryids;
-extern HTAB 		*pgws_hash;
-extern LWLock 		*pgws_hash_lock;
+extern HTAB 		*pgws_profile_hash;
+extern LWLock 		*pgws_profile_lock;
+extern uint64		*pgws_profile_samples;
 extern History		*pgws_history_ring;
 extern LWLock		*pgws_history_lock;
 
