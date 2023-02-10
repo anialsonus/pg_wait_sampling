@@ -639,10 +639,10 @@ pg_wait_sampling_get_profile(PG_FUNCTION_ARGS)
 			values[0] = Int32GetDatum(item->pid);
 		else
 			nulls[0] = true;
-		if (event_type)
-			values[1] = PointerGetDatum(cstring_to_text(event_type));
-		else
-			nulls[1] = true;
+		/* Event type is always not NULL'd for regular wait event or CPU time */
+		Assert(event_type);
+		values[1] = PointerGetDatum(cstring_to_text(event_type));
+		nulls[1] = false;
 		if (event)
 			values[2] = PointerGetDatum(cstring_to_text(event));
 		else
